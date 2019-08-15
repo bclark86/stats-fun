@@ -69,7 +69,7 @@ __Does Brett Maher have a Hash Marks Problem?__
 
 # 2. Hypothesis 
 
-er an article written recently by [Cassie Kozyrkov](https://hackernoon.com/statistical-inference-in-one-sentence-33a4683a6424), statistical inference boils down to one question posed by [R.A. Fisher](https://en.wikipedia.org/wiki/Ronald_Fisher), credited for the creation of modern statistical inference:
+In an [article](https://hackernoon.com/statistical-inference-in-one-sentence-33a4683a6424) written  by Cassie Kozyrkov, statistical inference boils down to one question posed by [R.A. Fisher](https://en.wikipedia.org/wiki/Ronald_Fisher), credited for the creation of modern statistical inference:
 
 >“Does the evidence that we collected make our null hypothesis look ridiculous?”
 

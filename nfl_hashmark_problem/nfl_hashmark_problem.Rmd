@@ -167,7 +167,7 @@ We see that there is not strong evidence to support our null hypothesis being ri
 
 we will use the `infer`package in R to simulate our null hypothesis and check how rare our observed difference would be if the null hypothesis (no relationship) were true. 
 
-![inferchart](https://raw.githubusercontent.com/tidymodels/infer/master/figs/ht-diagram.png)
+![](https://raw.githubusercontent.com/tidymodels/infer/master/figs/ht-diagram.png)
 
 ```{r}
 # calculate observed cchi-square stat

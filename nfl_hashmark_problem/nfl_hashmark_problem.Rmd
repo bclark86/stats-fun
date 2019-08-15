@@ -1,0 +1,211 @@
+---
+title: "Does Brett Maher have a Hash Marks Problem?"
+author: "Bryan Clark"
+date: "2019-08-12"
+output: 
+  html_document:
+    highlight: default
+    theme: cosmo
+    toc: true
+    toc_float: true
+    df_print: tibble
+---
+
+```{r setup, include = FALSE}
+# customize output options 
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 6, fig.asp = 0.618, out.width = "70%", 
+                      fig.align = "center")
+
+# rmarkdown
+library(knitr)
+library(kableExtra)
+
+# helpers
+library(tidyverse)
+
+# testing
+library(infer)
+
+# set theme for plots
+theme_set(theme_minimal(base_family = "Avenir"))
+
+# The palette with grey:
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+               "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+
+![Photo by Ronald Martinez/Getty Images](https://imagesvc.timeincapp.com/v3/fan/image?url=https://sportdfw.com/wp-content/uploads/getty-images/2017/07/1035132978.jpeg&c=sc&w=850&h=560)
+
+# Introduction
+
+We are at the point of the NFL calendar when fantasy football drafts start heating up and the talk out of training camp gravitates towards the extreme end of the hyperbole spectrum. From fans to reporters, players are closely monitored to water the seeds of optimism or doubt heading to the start of the season. 
+
+As a Dallas Cowboys fan, this is only amplified. One area of particular concern comes in the kicking game, with confidence in Brett Maher's accuracy waning. This [article](https://www.bloggingtheboys.com/2019/8/12/20800655/apparently-brett-maher-has-a-hash-marks-problem) from [bloggingtheboys.com](https://www.bloggingtheboys.com/) does a good job detailing the background:
+
+>Kickers score points in football. That means that they are extremely important. The Cowboys played 13 games last season that were decided by one score so odds are that they’re going to be in some tight situations in 2019. They currently employ a kicker in Brett Maher that boasts an 80.6% career field goal percentage, and during his first preseason game of the year he fell below that (75%) as he went three of four in San Francisco.
+What is it about Maher that seems to be the problem, though? If we had to isolate his issues, where do the inefficiencies lie? There has to be a specific answer here, right? It’s not just “he’s missing a lot of kicks,” is it?
+
+The article continues to highlight one theory for the struggles: __Apparently the Cowboys feel Brett Maher struggles from the right hash__
+
+>Among the many things to return on Saturdayed was Kristi Scales roaming the sidelines of America’s Team and providing us with exceptional insight. She detailed some of the things she learned on the sidelines over at the Dallas Morning News and one of her observations was that a Cowboys staffer acknowledged that Brett Maher struggles with kicks from the right hash mark.
+
+Ok, but does he actually struggle from the right hash mark?
+
+>If you’re wondering, Maher wasn’t exactly horrible from the right hash mark during his only season with the Cowboys. The DMN’s Calvin Watkins tweeted out the details on Monday morning, and attempts from the right hash mark were in fact Maher’s kryptonite last season.
+
+The tweet can be found [here](https://twitter.com/calvinwatkins/status/1160928910785126401) and contains the text below:
+
+>Got some hash mark stats from 2018 on Brett Maher: 9-12 right hash, 4-5 middle, 16-19 left hash. In weeks 13-17 where he struggled down the stretch he went 6-9 left hash and 1-1 from right hash.
+
+Upon reading this, I set out to see if we could validate the concern by testing to see if we can detect a difference in Brett Maher's kicking success based on the hash mark of the attempt. 
+
+# 1. Question
+
+So that brings us to the purpose of this analysis. Based on the 2018 kicking data...
+
+__Does Brett Maher have a Hash Marks Problem?__
+
+# 2. Hypothesis 
+
+er an article written recently by [Cassie Kozyrkov](https://hackernoon.com/statistical-inference-in-one-sentence-33a4683a6424), statistical inference boils down to one question posed by [R.A. Fisher](https://en.wikipedia.org/wiki/Ronald_Fisher), credited for the creation of modern statistical inference:
+
+>“Does the evidence that we collected make our null hypothesis look ridiculous?”
+
+To understand if Brett Maher has a hash marks problem, we are going to contruct a hypothesis that states there is a relationship between the hash mark of the attempt and whether he makes/misses. Our null hypothesis is then that there is no relationship and any differences are due to random chance. 
+
++ __Null hypothesis:__ There is no realationship between the hash mark of the kick attempt and the likelihood of success
++ __Alternative hypothesis:__ There is a relationship between the hash mark of the kick attempt and the likelihood of success (i.e. we've got a hash mark problem)
+
+# 3. Data
+
+The data used for this study will be generated based on the statistics provided from Calvin Watkin's [tweet](https://twitter.com/calvinwatkins/status/1160928910785126401). 
+
+__Disclaimer__
+
+It is worth noting that, while this data will help verify if we can detect a relationship in Brett Maher's 2018 performance, it will not tell us whether he has a hash marks problem in practice. If the data from practice is made available, the analysis methodology can be replicated with updated figures. 
+
+## 3.1 Data Generation
+
+```{r}
+# update this cell if new data is available
+# can be made into a function if built into a tool
+
+# right
+right <- data_frame(
+  hash = rep("right", 12),
+  kick = c(rep("make", 9), rep("miss", 3))
+)
+
+# middle
+middle <- data_frame(
+  hash = rep("middle", 5),
+  kick = c(rep("make", 4), rep("miss", 1))
+)
+
+# left
+left <- data_frame(
+  hash = rep("left", 19),
+  kick = c(rep("make", 16), rep("miss", 3))
+)
+
+# combined
+kicks <- bind_rows(right, middle, left) %>% 
+  mutate_if(is.character, as.factor)
+
+# contingency table
+table(kicks$hash, kicks$kick)
+```
+
+## 3.2 Data Visualization
+
+In the chart below, we can see why there is cause for concern. Brett Maher's attempts from the right hash do show a higher share of misses. But the sample size of kicks from 2018 is small, so these differences may not be due to a statistically meaningful relationship. 
+
+```{r}
+kicks %>%
+  ggplot(aes(x = hash, fill = kick)) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c(cbPalette[1], cbPalette[7])) + 
+  labs(
+    title = "Brett Maher Kick 2018 Field-Goal Attempts",
+    x = "Hash Mark",
+    y = "Proportion",
+    caption = "Source: Twitter",
+    fill = "Outcome"
+  )
+```
+
+# 4. Model
+
+To test our hypothesis, we are going to do a chi-squared test. Per [wikipedia](https://en.wikipedia.org/wiki/Chi-squared_test):
+
+>The chi-squared test is used to determine whether there is a significant difference between the expected frequencies and the observed frequencies in one or more categories.
+
+However, we have a really small sample size and this can interfere with the necessary calculations as shown [here](http://www.biostathandbook.com/small.html). A commonly cited rule of thumb (mentioned in the article) is that no cell should have an expected value less than 5. This is because the sampling distribution of the test statistic isn't well approximated by the chi-squared distribution when you have very low expected counts. 
+
+This is the case with the 2018 data, so we have a few ways around it:
+
++ Chi-Square Simulation Test
++ Chi-Square Permutation Test
+
+## 4.1 Chi-Squared Simulated Test
+
+Per the R documentation in `?chisq.test`:
+
+>In the contingency table case simulation is done by random sampling from the set of all contingency tables with given marginals, and works only if the marginals are strictly positive. Continuity correction is never used, and the statistic is quoted without it. Note that this is not the usual sampling situation assumed for the chi-squared test but rather that for Fisher's exact test.
+
+```{r}
+set.seed(110)
+
+chisq.test(kicks$hash, kicks$kick, simulate.p.value = T, B = 1000)
+```
+
+We see that there is not strong evidence to support our null hypothesis being ridiculous. 
+
+## 4.2 Chi-Sqaured Permutation Test
+
+we will use the `infer`package in R to simulate our null hypothesis and check how rare our observed difference would be if the null hypothesis (no relationship) were true. 
+
+![inferchart](https://raw.githubusercontent.com/tidymodels/infer/master/figs/ht-diagram.png)
+
+```{r}
+# calculate observed cchi-square stat
+obs_chisq <- kicks %>%
+  specify(kick ~ hash) %>%
+  calculate(stat = "Chisq") %>%
+  pull()
+
+# simulate null universe
+null_dist <- kicks %>%
+  specify(kick ~ hash) %>%
+  hypothesize(null = "independence") %>% 
+  generate(reps = 1000, type = "permute") %>% 
+  calculate(stat = "Chisq")
+
+# plot simulation
+null_dist %>%
+  visualize() +
+  geom_vline(xintercept = obs_chisq, color = "red", linetype = "dashed") +
+  labs(
+    title = "Simulation of Null Universe",
+    subtitle = "Assumes no relationship between hash and makes",
+    x = "Chi-Squared Statistic",
+    y = "Simulation Trials"
+  )
+```
+
+```{r}
+null_dist %>%
+  get_p_value(obs_stat = obs_chisq, direction = "greater")
+```
+
+Similarly to our simulated chi-square test, we have very little evidence based on the 2018 data to assert that Brett Maher has a hash mark problem. 
+
+# 5. Conclusion
+
+In short, based on the 2018 data, we do not have much statistical evidence to support the claim that Brett Maher has a hash marks problem. Our tests of a significant relationship show very high p-values, which means there is a high likelihood that there is no relationship. 
+
+That said, that doesn't mean a relationship doesn't exist. First, our sample size is very small with only 36 total kicks. We could find that by adding kicks he takes during the season, a relationship starts to emerge. That said, the NFL is a "what have you done for me lately?" business, so there may not be time to wait for more data to become available. 
+
+It is also possible that there have been issues so far in training camp to bring cause for concern. If training camp data were available, we could re-run the entire analysis and determine if an intervention is needed.

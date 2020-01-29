@@ -1,0 +1,673 @@
+---
+output: github_document
+---
+
+```{r setup, include=FALSE}
+# customize output options 
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, 
+                      message = FALSE, cache = TRUE,
+                      fig.width = 6, fig.asp = 0.618, 
+                      out.width = "70%", fig.align = "center")
+```
+
+All models are wrong, I hope this one is useful. We want to predict the outcome of the 2020 Super Bowl between the Kansas City Chiefs and San Francisco 49ers. The questions we seek to answer are below. 
+
+# 1. Questions
+
++ Who is going to win the 2020 Super Bowl between the Kansas City Chiefs and San Francisco 49ers?
++ What is the predicted score?
++ What is the probability of the over/under?
++ What is the probability of covering the spread in one direction or another?
++ What is the probability of overtime?
+
+# 2. Data
+
+```{r}
+# helpers
+library(skimr)
+library(tidyverse)
+library(tictoc)
+library(furrr)
+library(future)
+
+# bayesian modeling
+library(brms)
+
+# visualization
+library(tidybayes)
+library(ggridges)
+
+# set theme for plots
+theme_set(theme_bw(base_family = "Avenir"))
+
+# scripts
+source("R/fetch_nfl_plays.R")
+```
+
+## 2.1 Source Data
+
+The data for this analysis comes from the [nflscrapR](https://github.com/mcbarlowe/nflscraper) package that has play-by-play game logs for the entire season. 
+
+```{r}
+data_dir <- fs::path("..", "data")
+
+# wrapped for nflscrapR to save/load data
+plays <- fetch_nfl_plays(season = 2019, 
+                         type = c("reg", "post"),
+                         data_dir = data_dir)
+```
+
+## 2.2 Prepare Data
+
+We will use the outcomes of each game with the home and away team for our model. To do this, we find the max score for each team in the game (no negative points). 
+
+```{r}
+# aggregate plays to game level
+games <- plays %>%
+  group_by(game_id, home_team, away_team) %>%
+  summarize(home_score = max(total_home_score),
+            away_score = max(total_away_score)) %>%
+  ungroup() %>%
+  # game_id for first wildcard game (TEN @ NE)
+  mutate(playoffs = ifelse(game_id >= 2020010400, TRUE, FALSE))
+```
+
+## 2.3 Skim Data
+
+```{r}
+games %>% skimr::skim()
+```
+
+```{r}
+# playoff games
+games %>% tail(10)
+```
+
+## 2.4 Explore
+
+We will explore a few different plots of our data:
+
+1. Each team's deviation from the mean points for (home and away games)
+2. Each team's deviation from the mean points against (home and away games)
+3. The shape of the distribution for home and away points for 
+
+### 2.4.1 Points For Deviation
+
+```{r, fig.asp=1}
+home_teams_for <- games %>%
+  mutate(score_centered = home_score - mean(home_score)) %>%
+  select(home_team, score_centered) %>%
+  mutate(game_type = "home") %>%
+  rename(team = home_team)
+
+away_teams_for <- games %>%
+  mutate(score_centered = away_score - mean(away_score)) %>%
+  select(away_team, score_centered) %>%
+  mutate(game_type = "away") %>%
+  rename(team = away_team)
+
+teams_for <- bind_rows(home_teams_for, away_teams_for)
+
+teams_for %>%
+  ggplot(aes(game_type, score_centered, color = game_type)) +
+  geom_boxplot() +
+  facet_wrap(~team) +
+  coord_flip() +
+  labs(
+    title = "Points For Deviation from Mean",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "",
+    y = "",
+    caption = "Source: nflscrapR"
+  ) + 
+  guides(color = FALSE) +
+  scale_color_viridis_d(direction = -1,
+                        option = "inferno",
+                        begin = 0, end = 0.5)
+```
+
+### 2.4.2 Points Against Deviation
+
+```{r, fig.asp=1}
+home_teams_against <- games %>%
+  mutate(score_centered = away_score - mean(away_score)) %>%
+  select(home_team, score_centered) %>%
+  mutate(game_type = "home") %>%
+  rename(team = home_team)
+
+away_teams_against <- games %>%
+  mutate(score_centered = home_score - mean(home_score)) %>%
+  select(away_team, score_centered) %>%
+  mutate(game_type = "away") %>%
+  rename(team = away_team)
+
+teams_against <- bind_rows(home_teams_against, away_teams_against)
+
+teams_against %>%
+  ggplot(aes(game_type, score_centered, color = game_type)) +
+  geom_boxplot() +
+  facet_wrap(~team) +
+  coord_flip() +
+  labs(
+    title = "Points Against Deviation from Mean",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "",
+    y = "",
+    caption = "Source: nflscrapR"
+  ) + 
+  guides(color = FALSE) +
+  scale_color_viridis_d(direction = -1,
+                        option = "inferno",
+                        begin = 0, end = 0.5)
+```
+
+### 2.4.3 Points Distribution
+
+This is probably the most important plot as it will help inform which distribution we should select for the model outcome. 
+
+```{r}
+games %>% 
+  pivot_longer(cols = c(home_score, away_score),
+               names_to = "type", values_to = "score") %>%
+  ggplot(aes(score, fill = type)) +
+  geom_histogram(binwidth = 5, color = "white") +
+  facet_wrap(~type) +
+  labs(
+    title = "Points For Distribution",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "",
+    y = "",
+    caption = "Source: nflscrapR"
+  ) + 
+  guides(fill = FALSE) +
+  scale_fill_viridis_d(direction = -1,
+                        option = "inferno",
+                        begin = 0, end = 0.5)
+```
+
+
+# 3. Model
+
+The goal of this analysis is to use a super simple model that carries enough predictive power to be effective. We will use a [hierarchical bayesian regression](https://en.wikipedia.org/wiki/Bayesian_hierarchical_modeling) that treats the home and away team as a random effect for predicting the home and away score. This pools information together and reduces the impact of outliers due to having a small sample size for each team (8 home and 8 away games). 
+
+In other words, we pull the more extreme values back towards the mean when estimating the impact each team has on the home or away score deviation away from the mean.
+
+The outcome of the model is a posterior of the predicted score that we will use to simulate game outcomes. We will use a poisson distribution to model the outcome of the home or away score. 
+
+## 3.1 Home Team Points
+
+### 3.1.1 Model Fit
+
+```{r, cache=TRUE}
+# allow for parallel processing
+plan(multiprocess)
+
+# fit model with standard priors (weakly informative) 
+home_pts_model <- brms::brm(
+  family = poisson(),
+  home_score ~ playoffs + (1 | home_team) + (1 | away_team),
+  data = games,
+  chains = 5, 
+  iter = 3000,
+  warmup = 1000,
+  future = T,
+  seed = 408,
+  refresh = 0 # prevents print out
+)
+```
+
+### 3.1.2 Model Summary
+
+```{r}
+summary(home_pts_model)
+```
+
+### 3.1.3 Model Evaluation
+
+```{r}
+bayes_R2(home_pts_model)
+```
+
+### 3.1.4 Team Coefficients
+
+Below is the posterior distribution of each team along with the varying intercept for points for when they are the home team. In other words, how effective is the offense at home?
+
+```{r}
+# sample draws of the home_team coefficient for home points
+home_pts_for <- home_pts_model %>%
+  spread_draws(b_Intercept, r_home_team[home_team,]) %>%
+  # get deviation from mean and exponent to bring back to points
+  median_qi(home_team_mean = exp(b_Intercept + r_home_team)) %>%
+  arrange(desc(home_team_mean))
+
+home_pts_for
+```
+
+```{r, fig.asp = NULL, out.width = "50%", fig.height=6, fig.width=4}
+
+home_pts_model %>%
+  spread_draws(b_Intercept, r_home_team[home_team, ]) %>%
+  mutate(score_mean = exp(b_Intercept + r_home_team)) %>%
+  ungroup() %>%
+  mutate(team = fct_reorder(home_team, score_mean)) %>%
+  mutate(superbowl = ifelse(team %in% c("KC", "SF"), team, "other")) %>%
+  ggplot(aes(y = team, x = score_mean,
+             fill = superbowl)) +
+  geom_density_ridges() +
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#E31837", "#B3995D", "#999999")) +
+  labs(
+    title = "Points For as the Home Team",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "Points For",
+    y = "",
+    caption = "Source: Bayesian Hierarchical Model"
+  )
+```
+
+Below is the posterior distribution of each team along with the varying intercept for points against when they are the away team. In other words, how effective is the defense on the road?
+
+```{r}
+home_pts_model %>%
+  spread_draws(b_Intercept, r_away_team[away_team,]) %>%
+  # get deviation from mean and exponent to bring back to points
+  median_qi(away_team_mean = exp(b_Intercept + r_away_team)) %>%
+  arrange(away_team_mean)
+```
+
+```{r, fig.asp = NULL, out.width = "50%", fig.height=6, fig.width=4}
+
+home_pts_model %>%
+  spread_draws(b_Intercept, r_away_team[away_team, ]) %>%
+  mutate(score_mean = exp(b_Intercept + r_away_team)) %>%
+  ungroup() %>%
+  mutate(team = fct_reorder(away_team, score_mean)) %>%
+  mutate(superbowl = ifelse(team %in% c("KC", "SF"), team, "other")) %>%
+  ggplot(aes(y = team, x = score_mean,
+             fill = superbowl)) +
+  geom_density_ridges() +
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#B3995D", "#E31837", "#999999")) +
+  labs(
+    title = "Points Against as the Away Team",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "Points Against",
+    y = "",
+    caption = "Source: Bayesian Hierarchical Model"
+  )
+```
+
+## 3.2 Away Team Points
+
+### 3.2.1 Model Fit
+
+```{r, cache=TRUE}
+plan(multiprocess)
+
+away_pts_model <- brms::brm(
+  family = poisson(),
+  away_score ~ playoffs + (1 | home_team) + (1 | away_team),
+  data = games,
+  chains = 5, 
+  iter = 3000,
+  warmup = 1000,
+  future = T,
+  seed = 408,
+  refresh = 0 # prevents print out
+)
+```
+
+### 3.1.2 Model Summary
+
+```{r}
+summary(away_pts_model)
+```
+
+### 3.1.3 Model Evaluation
+
+```{r}
+bayes_R2(away_pts_model)
+```
+
+### 3.1.4 Team Coefficients
+
+Below is the posterior distribution of each team along with the varying intercept for points for when they are the away team. In other words, how effective is the offense on the road?
+
+```{r}
+away_pts_model %>%
+  spread_draws(b_Intercept, r_away_team[away_team,]) %>%
+  # get deviation from mean and exponent to bring back to points
+  median_qi(away_team_mean = exp(b_Intercept + r_away_team)) %>%
+  arrange(desc(away_team_mean))
+```
+
+```{r, fig.asp = NULL, out.width = "50%", fig.height=6, fig.width=4}
+
+away_pts_model %>%
+  spread_draws(b_Intercept, r_away_team[away_team, ]) %>%
+  mutate(score_mean = exp(b_Intercept + r_away_team)) %>%
+  ungroup() %>%
+  mutate(team = fct_reorder(away_team, score_mean)) %>%
+  mutate(superbowl = ifelse(team %in% c("KC", "SF"), team, "other")) %>%
+  ggplot(aes(y = team, x = score_mean,
+             fill = superbowl)) +
+  geom_density_ridges() +
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#B3995D", "#E31837", "#999999")) +
+  labs(
+    title = "Points For as the Away Team",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "Points For",
+    y = "",
+    caption = "Source: Bayesian Hierarchical Model"
+  )
+```
+
+Below is the posterior distribution of each team along with the varying intercept for points against when they are the away team. In other words, how effective is the defense on the road?
+
+```{r}
+away_pts_model %>%
+  spread_draws(b_Intercept, r_home_team[home_team,]) %>%
+  # get deviation from mean and exponent to bring back to points
+  median_qi(home_team_mean = exp(b_Intercept + r_home_team)) %>%
+  arrange(home_team_mean)
+```
+
+```{r, fig.asp = NULL, out.width = "50%", fig.height=6, fig.width=4}
+
+away_pts_model %>%
+  spread_draws(b_Intercept, r_home_team[home_team, ]) %>%
+  mutate(score_mean = exp(b_Intercept + r_home_team)) %>%
+  ungroup() %>%
+  mutate(team = fct_reorder(home_team, score_mean)) %>%
+  mutate(superbowl = ifelse(team %in% c("KC", "SF"), team, "other")) %>%
+  ggplot(aes(y = team, x = score_mean,
+             fill = superbowl)) +
+  geom_density_ridges() +
+  guides(fill = FALSE) +
+  scale_fill_manual(values = c("#E31837", "#B3995D", "#999999")) +
+  labs(
+    title = "Points Against as the Home Team",
+    subtitle = "2019 NFL Regular Season & Playoffs",
+    x = "Ponits Against",
+    y = "",
+    caption = "Source: Bayesian Hierarchical Model"
+  )
+```
+
+# 4. Evaluation
+
+## 4.1 Score Predictions
+
+We will go back through each game to see how well the model predicts the winner. To predict each winner, we will generate predicted draws from the predicted posterior distribution. We will also record whether the home or away team actual won the game to compare to our predicted outcomes. 
+
+```{r, cache=TRUE}
+plan(multiprocess)
+
+add_score_predictions <- function(data, ...) {
+  
+  data %>% 
+    add_predicted_draws(..., seed = 408) %>%
+    ungroup() %>%
+    select(.prediction)
+  
+}
+
+tic()
+
+# nest makes use of furrr::future_map for functional programming
+game_preds <- games %>%
+  mutate(
+    actual_winner = case_when(
+      home_score > away_score ~ "home",
+      home_score < away_score ~ "away",
+      T ~ "tie"
+    ),
+    home_score_diff = home_score - away_score
+  ) %>%
+  group_by(game_id, actual_winner, home_score_diff) %>% 
+  nest() %>%
+  mutate(
+    home_prediction = future_map(data, add_score_predictions, home_pts_model),
+    away_prediction = future_map(data, add_score_predictions, away_pts_model)
+  ) 
+
+toc()
+```
+
+## 4.2 Game Predictions
+
+We then use the predicted posterior draws to calculate the home team's win probability. This is based on the share of predicted posterior draws of the home team that are greater than the away team's predicted posterior. Additionally, we also generate a 95% credible interval for the predicted score differential to use to compare to the actual score differential. 
+
+```{r}
+game_prediction <- function(home_pred, away_pred) {
+  
+  # convert to vectors
+  home_pred <- home_pred %>% pull()
+  away_pred <- away_pred %>% pull()
+  
+  # what share of home scores are above away scores?
+  home_win_prob   <- mean(home_pred > away_pred)
+  
+  # 95% credible interval for the score differential
+  home_score_diff <- quantile(home_pred - away_pred,
+                              probs = c(.025, .50, .975)
+                              ) %>% t() %>% as_tibble()
+  
+  names(home_score_diff) <- c("diff_low_95", "diff_mid_50", "diff_high_95")
+  
+  game_pred <- tibble(home_win_prob) %>% 
+    bind_cols(home_score_diff)
+  
+  return(game_pred)
+  
+}
+
+# use purrr to apply to each nested dataset
+game_preds$outcome_prediction <- map2(game_preds$home_prediction,
+                                      game_preds$away_prediction,
+                                      game_prediction)
+```
+
+## 4.3 Prediction Accuracy
+
+Lastly for model accuracy, we check the accuracy by classifying the home team as the winner if their predicted probability is greater than 50%. When then compare that to the actual winner to determine if the prediction was accurate.
+
+NOTE: Generally, we would want to create a train/test split to evaluate the model on data it has never seen before. However, due to smaller sample sizes and only wanting to estimate a single game for the same season, I am okay with training on all the data. 
+
+There are some arguments [for](https://www.econjobrumors.com/topic/can-someone-explain-to-me-the-bayesian-methods-dont-overfit-argument) and [against](https://stats.stackexchange.com/questions/265094/is-it-true-that-bayesian-methods-dont-overfit) this approach being prone to overfitting the data. 
+
+```{r}
+game_preds <- game_preds %>%
+  unnest(outcome_prediction) %>%
+  mutate(
+    pred_score = case_when(
+      home_win_prob > 0.5 & actual_winner == "home" ~ 1,
+      home_win_prob < 0.5 & actual_winner == "away" ~ 1,
+      home_win_prob > 0.5 & actual_winner == "away" ~ 0,
+      home_win_prob < 0.5 & actual_winner == "home" ~ 0,
+      T ~ 0
+    )
+  )
+```
+
+What percentage of winner predictions were correct?
+
+```{r}
+mean(game_preds$pred_score)
+```
+
+What percentage of score differential predictions fell between the predicted 95% credible interval?
+
+```{r}
+mean(between(game_preds$home_score_diff, game_preds$diff_low_95, game_preds$diff_high_95))
+```
+
+# 5. Super Bowl Prediction
+
+For reference,  [CBS](https://www.cbssports.com/nfl/news/super-bowl-2020-spread-odds-line-points-total-chiefs-remain-favorites-in-close-call-matchup-vs-49ers/) shows the opening betting lines as -1 for KC Chiefs with an over/under of 52.5. The current lines, as of January 29th, 2020, are -1.5 for KC and an over/under of 54.5. 
+
+## 5.1 Data Setup
+
+Finally, we will generate predictions for the Super Bowl. Since the game is being played at a neutral site, we will generate predictions for two games, one where each team is the home and away team. 
+
+```{r}
+superbowl_tbl <- tibble(
+    game_id = c("SB1 - KC Home", "SB2 - SF Home"), 
+    home_team = c("KC", "SF"),
+    away_team = c("SF", "KC"),
+    playoffs  = c(TRUE, TRUE)
+  ) %>%
+  group_by(game_id) %>%
+  nest() %>%
+  mutate(
+      home_prediction = future_map(data, add_score_predictions, home_pts_model),
+      away_prediction = future_map(data, add_score_predictions, away_pts_model)
+    ) 
+
+superbowl_tbl
+```
+
+```{r}
+superbowl_tbl$outcome_prediction <- map2(superbowl_tbl$home_prediction,
+                                         superbowl_tbl$away_prediction,
+                                         game_prediction)
+```
+
+## 5.2 Predicted Games
+
+To generate outcomes, we will sample scores for each team from their combined home/away posteriors. Arguments could be made to have each team be the home team, each team be the away team, or to have KC be the home team since they are listed as such on the game card. 
+
+We will take a hybrid approach and weight the the home and away scores equally. A function is used so this number can easily be changed and compare outcomes. 
+
+```{r}
+superbowl_outcome <- function(home_team_advantage = .50) {
+  
+  set.seed(408)
+  sample_size <- 10000
+  
+  kc_home_scores <- superbowl_tbl %>%
+    filter(game_id =="SB1 - KC Home") %>%
+    pull(home_prediction) %>%
+    unlist()
+  
+  kc_away_scores <- superbowl_tbl %>%
+    filter(game_id =="SB2 - SF Home") %>%
+    pull(away_prediction) %>%
+    unlist()
+  
+  sf_away_scores <- superbowl_tbl %>%
+    filter(game_id =="SB1 - KC Home") %>%
+    pull(away_prediction) %>%
+    unlist()
+  
+  sf_home_scores <- superbowl_tbl %>%
+    filter(game_id =="SB2 - SF Home") %>%
+    pull(home_prediction) %>%
+    unlist()
+  
+  # sample from the home and away score posteriors with more weight towards home scores
+  kc_scores <- c(sample(kc_home_scores,
+                        size = (sample_size * home_team_advantage), replace = T),
+                 sample(kc_away_scores,
+                        size = (sample_size * (1 - home_team_advantage)), replace = T))
+  # sample from the home and away score posteriors with more weight towards away scores
+  sf_scores <- c(sample(sf_away_scores, 
+                        size = (sample_size * home_team_advantage), replace = T),
+                 sample(sf_home_scores, 
+                        size = (sample_size * (1 - home_team_advantage)), replace = T))
+  
+  # round the sample averages for the final score
+  print(glue("KC Score: {median(kc_scores)}"))
+  print(glue("SF Score: {median(sf_scores)}"))
+  print(glue("KC Win Probability: {mean(kc_scores > sf_scores)}"))
+  print(glue("SF Win Probability: {mean(kc_scores < sf_scores)}"))
+  print(glue("Tie Probability: {mean(kc_scores == sf_scores)}"))
+  
+  # combine collected of games
+  scores_tbl <- tibble(game = 1:sample_size, kc_scores, sf_scores) %>%
+    rename(kc = kc_scores, sf = sf_scores)
+  
+  return(scores_tbl)
+} 
+
+```
+
+We see below that based on the share of simulations, there is a slightly higher chance for KF (48.6%) to beat SF (47.2%), with 4% of games resulting in a tie (which cannot happen in the Super Bowl). 
+
+The median score for each team is 26. Since this can't happen, I would alter this prediction to a 27-26 finish for KC. This aligns with both the line (-1 for KC) and initial over/under of 52.5.
+
+```{r}
+scores_tbl <- superbowl_outcome()
+```
+
+## 5.3 Predicted Score Distribution
+
+Below shows the distribution of scores for each team. SF has a slightly wider variability, which would seem to indicate a larger boom or bust potential (high or low scores) compared to KC. 
+
+```{r}
+scores_tbl %>%
+  pivot_longer(cols = kc:sf, names_to = "team", values_to = "score") %>%
+  ggplot(aes(score, fill = team)) +
+  geom_histogram(color = "black",
+                 position = "identity",
+                 binwidth = 1, alpha = 3/4)  +
+  labs(
+    title = "Predicted Score Distribution",
+    subtitle = "Super Bowl LIV (NFL - 2020)",
+    x = "Points Scored",
+    y = "",
+    caption = "Source: b-clark predictions"
+  ) + 
+  scale_fill_manual(values = c("#E31837", "#B3995D"))
+```
+
+We can also take the approach of looking at the most common game outcomes. Using this approach, one could predict a 27-26 outcome for SF over KC. Each of these scores indicate a close game with less than one score seperating both teams. 
+
+```{r}
+scores_tbl %>%
+  count(kc, sf) %>%
+  arrange(desc(n))
+```
+
+## 5.4 Over/Under
+
+```{r}
+scores_tbl %>%
+  mutate(total_score = sf + kc) %>%
+  ggplot(aes(total_score)) +
+  geom_histogram(fill = "#2c3e50",
+                 color = "black",
+                 position = "identity",
+                 binwidth = 1, alpha = 3/4)  +
+  labs(
+    title = "Predicted Total Score Distribution",
+    subtitle = "Super Bowl LIV (NFL - 2020)",
+    x = "Total Points Scored",
+    y = "",
+    caption = "Source: b-clark predictions"
+  ) 
+```
+
+Given the current line, there is a 61% chance the total score will be under 54.5 points and a 39% chance it will be over. Given this information, we would take the under. 
+
+```{r}
+scores_tbl %>%
+  mutate(total_score = sf + kc) %>%
+  summarize(over_pct = mean(ifelse(total_score > 54.5, 1, 0)),
+            under_pct = mean(ifelse(total_score < 54.5, 1, 0)))
+```
+
+# 6. Conclusion
+
+## 6.1 Prediction Summary
+
+In conclusion, we used a relatively simple statistical model to produce simulations of 10,000 games. The final predictions are: 
+
++ KC Chiefs 27 - SF 49ers 26
++ Take the under at 54.5
++ 4% chance of there being overtime
+
+## 6.2 Improvements
+
+There is ample room for improving this model. It doesn't take into account several factors that affect performance during the year such as injuries, weather, or field conditions. Adding variables for stadium type, field type, and weather could greater improve the the performance of the model. 
